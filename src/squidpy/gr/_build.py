@@ -14,7 +14,7 @@ from numba import njit
 from shapely import LineString, MultiPolygon, Polygon
 from spatialdata import SpatialData
 from spatialdata._core.centroids import get_centroids
-from spatialdata._core.query.relational_query import get_element_instances, match_element_to_table
+from spatialdata._core.query.relational_query import get_element_instances
 from spatialdata._logging import logger as logg
 from spatialdata.models import get_table_keys
 from spatialdata.models.models import (
@@ -343,10 +343,20 @@ def _resolve_data(
         "Since input is a :class:`spatialdata.SpatialData`, `elements_to_coordinate_systems` must not be `None`."
     )
     table = extract_adata_if_sdata(data, table_key=table_key)
-    elements, matched_table = match_element_to_table(data, list(elements_to_coordinate_systems), table_key)
-    assert matched_table.obs_names.equals(table.obs_names), (
-        "The spatialdata table must annotate all elements keys. Some elements are missing, please check the `elements_to_coordinate_systems` dictionary."
-    )
+    # Access the requested elements directly instead of via ``match_element_to_table``.
+    # The latter performs a full relational right-join (``join_spatialelement_table``)
+    # only to (a) return the element objects and (b) let us assert the table is aligned.
+    # That join is O(n_cells) with heavy pandas overhead and is redundant here: the
+    # centroid loop below already uses the native ``data[region_]`` elements, and the
+    # explicit instance/region validation below verifies that the table is aligned with
+    # the elements' native ordering (which is exactly what the positional
+    # ``table.obsm[spatial_key] = np.concatenate(centroids)`` assignment requires).
+    missing = [name for name in elements_to_coordinate_systems if name not in data]
+    if missing:
+        raise KeyError(
+            f"Element(s) {missing} from `elements_to_coordinate_systems` were not found in the SpatialData object."
+        )
+    elements = {name: data[name] for name in elements_to_coordinate_systems}
     regions, region_key, instance_key = get_table_keys(table)
     regions = [regions] if isinstance(regions, str) else regions
     ordered_regions_in_table = table.obs[region_key].unique()
@@ -365,8 +375,11 @@ def _resolve_data(
         elem_instances.append(element_instances)
 
     element_instances = pd.concat(elem_instances)
-    if (not np.all(element_instances.values == table.obs[instance_key].values)) or (
-        not np.all(ordered_regions_in_table == regions)
+    # ``np.array_equal`` (unlike ``np.all(a == b)``) returns ``False`` rather than
+    # erroring when the lengths differ, so it safely catches a table that does not
+    # match the elements 1:1 now that the relational join no longer guards this.
+    if not np.array_equal(element_instances.to_numpy(), table.obs[instance_key].to_numpy()) or not np.array_equal(
+        np.asarray(ordered_regions_in_table), np.asarray(regions)
     ):
         raise ValueError(
             "The spatialdata table must annotate all elements keys. Some elements are missing or not ordered correctly, please check the `elements_to_coordinate_systems` dictionary."
